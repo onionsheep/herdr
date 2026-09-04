@@ -8,9 +8,16 @@
 //! new enum values need an `Unknown` fallback. Unknown named controls are
 //! optional and ignored unless negotiated as part of the core.
 
+use std::fmt;
+use std::io;
+
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use super::{ClientShellSnapshot, ClientSurfaceSize, ServerMessage};
+use super::{
+    ClientClipboardImageTarget, ClientMessage, ClientShellSnapshot, ClientSurfaceSize,
+    ServerMessage,
+};
 
 pub const ENDPOINT_PROTOCOL_GENERATION: u32 = 1;
 pub const ENDPOINT_HELLO_KIND: &str = "endpoint.hello.v1";
@@ -31,6 +38,12 @@ pub const HEALTH_PONG_KIND: &str = "endpoint.health.pong.v1";
 fn default_true() -> bool {
     true
 }
+pub const CLIPBOARD_FILE_CONTROL_KIND: &str = "clipboard.file.v1";
+pub const CLIPBOARD_FILE_CAPABILITY: &str = CLIPBOARD_FILE_CONTROL_KIND;
+pub const MAX_CLIPBOARD_FILE_NAME_BYTES: usize = 255;
+pub const MAX_CLIPBOARD_FILE_PAYLOAD: usize = super::MAX_CLIPBOARD_IMAGE_PAYLOAD;
+const MAX_CLIPBOARD_FILE_JSON_METADATA_BYTES: usize = 4 * 1024;
+const MAX_CLIPBOARD_FILE_BASE64_BYTES: usize = MAX_CLIPBOARD_FILE_PAYLOAD.div_ceil(3) * 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointClientHello {
@@ -76,6 +89,110 @@ pub struct EndpointServerWelcome {
     pub error: Option<EndpointHandshakeError>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointClipboardFile {
+    pub target: ClientClipboardImageTarget,
+    pub file_name: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedClipboardFile {
+    pub target: ClientClipboardImageTarget,
+    pub file_name: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum ClipboardFileDecodeError {
+    PayloadTooLarge,
+    EmptyPayload,
+    InvalidJson(serde_json::Error),
+    InvalidFileName,
+    InvalidBase64(base64::DecodeError),
+}
+
+impl fmt::Display for ClipboardFileDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PayloadTooLarge => formatter.write_str("clipboard file payload is too large"),
+            Self::EmptyPayload => formatter.write_str("clipboard file payload is empty"),
+            Self::InvalidJson(error) => write!(formatter, "invalid clipboard file JSON: {error}"),
+            Self::InvalidFileName => formatter.write_str("invalid clipboard file name"),
+            Self::InvalidBase64(error) => {
+                write!(formatter, "invalid clipboard file base64: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClipboardFileDecodeError {}
+
+pub fn clipboard_file_message(
+    target: ClientClipboardImageTarget,
+    file_name: String,
+    data: &[u8],
+) -> serde_json::Result<ClientMessage> {
+    validate_clipboard_file_name(&file_name).map_err(serde_json::Error::io)?;
+    if data.is_empty() {
+        return Err(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "clipboard file payload is empty",
+        )));
+    }
+    if data.len() > MAX_CLIPBOARD_FILE_PAYLOAD {
+        return Err(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "clipboard file payload is too large",
+        )));
+    }
+
+    let payload = EndpointClipboardFile {
+        target,
+        file_name,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(data),
+    };
+    Ok(ClientMessage::EndpointControl {
+        kind: CLIPBOARD_FILE_CONTROL_KIND.into(),
+        data: serde_json::to_string(&payload)?,
+    })
+}
+
+pub fn decode_clipboard_file(data: &str) -> Result<DecodedClipboardFile, ClipboardFileDecodeError> {
+    if data.len() > MAX_CLIPBOARD_FILE_BASE64_BYTES + MAX_CLIPBOARD_FILE_JSON_METADATA_BYTES {
+        return Err(ClipboardFileDecodeError::PayloadTooLarge);
+    }
+    let payload: EndpointClipboardFile =
+        serde_json::from_str(data).map_err(ClipboardFileDecodeError::InvalidJson)?;
+    validate_clipboard_file_name(&payload.file_name)
+        .map_err(|_| ClipboardFileDecodeError::InvalidFileName)?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload.data_base64)
+        .map_err(ClipboardFileDecodeError::InvalidBase64)?;
+    if decoded.is_empty() {
+        return Err(ClipboardFileDecodeError::EmptyPayload);
+    }
+    if decoded.len() > MAX_CLIPBOARD_FILE_PAYLOAD {
+        return Err(ClipboardFileDecodeError::PayloadTooLarge);
+    }
+
+    Ok(DecodedClipboardFile {
+        target: payload.target,
+        file_name: payload.file_name,
+        data: decoded,
+    })
+}
+
+fn validate_clipboard_file_name(file_name: &str) -> io::Result<()> {
+    if file_name.is_empty() || file_name.len() > MAX_CLIPBOARD_FILE_NAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clipboard file name must contain 1 to 255 UTF-8 bytes",
+        ));
+    }
+    Ok(())
+}
+
 pub fn snapshot_message(snapshot: &ClientShellSnapshot) -> serde_json::Result<ServerMessage> {
     Ok(ServerMessage::EndpointControl {
         kind: ENDPOINT_SNAPSHOT_KIND.into(),
@@ -114,6 +231,7 @@ impl EndpointServerWelcome {
                 SURFACE_INTEREST_CAPABILITY.into(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.into(),
                 HEALTH_CHECK_CAPABILITY.into(),
+                CLIPBOARD_FILE_CAPABILITY.into(),
             ],
             error: None,
         }
@@ -218,6 +336,91 @@ mod tests {
     }
 
     #[test]
+    fn frozen_welcome_without_capabilities_decodes_with_empty_capabilities() {
+        let welcome: EndpointServerWelcome = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/endpoint-welcome-v1.json"
+        )))
+        .unwrap();
+
+        assert!(welcome.capabilities.is_empty());
+    }
+
+    #[test]
+    fn compatible_welcome_advertises_single_file_clipboard_bridge() {
+        let welcome = EndpointServerWelcome::compatible(vec!["pane.focus".into()]);
+
+        assert!(welcome
+            .capabilities
+            .iter()
+            .any(|value| value == CLIPBOARD_FILE_CAPABILITY));
+    }
+
+    #[test]
+    fn clipboard_file_control_roundtrips_binary_bytes_and_target() {
+        let message = clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::Pane("w1:p1".into()),
+            "报告 2026.pdf".into(),
+            b"\0binary\xff",
+        )
+        .unwrap();
+        let crate::protocol::ClientMessage::EndpointControl { kind, data } = message else {
+            panic!("file bridge must use endpoint control");
+        };
+
+        assert_eq!(kind, CLIPBOARD_FILE_CONTROL_KIND);
+        let decoded = decode_clipboard_file(&data).unwrap();
+        assert_eq!(
+            decoded.target,
+            crate::protocol::ClientClipboardImageTarget::Pane("w1:p1".into())
+        );
+        assert_eq!(decoded.file_name, "报告 2026.pdf");
+        assert_eq!(decoded.data, b"\0binary\xff");
+    }
+
+    #[test]
+    fn clipboard_file_control_rejects_invalid_payloads() {
+        assert!(decode_clipboard_file(
+            r#"{"target":"DirectTerminal","file_name":"report.pdf","data_base64":"not base64!"}"#
+        )
+        .is_err());
+        assert!(
+            decode_clipboard_file(r#"{"target":"DirectTerminal","data_base64":"dGVzdA=="}"#)
+                .is_err()
+        );
+        assert!(clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            String::new(),
+            b"contents",
+        )
+        .is_err());
+        assert!(clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            "empty.bin".into(),
+            b"",
+        )
+        .is_err());
+        assert!(matches!(
+            decode_clipboard_file(
+                r#"{"target":"DirectTerminal","file_name":"empty.bin","data_base64":""}"#
+            ),
+            Err(ClipboardFileDecodeError::EmptyPayload)
+        ));
+        assert!(clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            "x".repeat(MAX_CLIPBOARD_FILE_NAME_BYTES + 1),
+            b"contents",
+        )
+        .is_err());
+        assert!(clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+            "huge.bin".into(),
+            &vec![0; MAX_CLIPBOARD_FILE_PAYLOAD + 1],
+        )
+        .is_err());
+    }
+
+    #[test]
     fn frozen_generation_one_snapshot_decodes() {
         let snapshot: ClientShellSnapshot = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -284,6 +487,7 @@ mod tests {
                 SURFACE_INTEREST_CAPABILITY.to_string(),
                 PRESENTATION_EFFECTS_FENCE_CAPABILITY.to_string(),
                 HEALTH_CHECK_CAPABILITY.to_string(),
+                CLIPBOARD_FILE_CAPABILITY.to_string(),
             ]
         );
     }

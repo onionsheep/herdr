@@ -8,8 +8,8 @@ use std::ptr::NonNull;
 use std::sync::OnceLock;
 
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    read_limited_reader, ClipboardCommand, ClipboardFileSelection, ClipboardImage, ForegroundJob,
+    ForegroundProcess, LimitedRead, Signal,
 };
 
 pub(crate) use super::unix_common::{
@@ -574,6 +574,70 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     })
 }
 
+pub fn read_clipboard_file() -> ClipboardFileSelection {
+    const SCRIPT: &str = r#"
+ObjC.import('AppKit');
+const pasteboard = $.NSPasteboard.generalPasteboard;
+const options = $.NSMutableDictionary.alloc.init;
+options.setObjectForKey(true, $.NSPasteboardURLReadingFileURLsOnlyKey);
+const urls = pasteboard.readObjectsForClassesOptions([$.NSURL], options);
+let result;
+if (!urls || urls.count === 0) {
+  result = null;
+} else if (urls.count !== 1) {
+  result = false;
+} else {
+  result = ObjC.unwrap(urls.objectAtIndex(0).path);
+}
+JSON.stringify(result);
+"#;
+
+    let mut child = match Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", SCRIPT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return ClipboardFileSelection::Absent,
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ClipboardFileSelection::Absent;
+    };
+    let read = read_limited_reader(stdout, 64 * 1024);
+    if matches!(read, Ok(LimitedRead::Oversized) | Err(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return ClipboardFileSelection::Rejected;
+    }
+    let Ok(status) = child.wait() else {
+        return ClipboardFileSelection::Absent;
+    };
+    if !status.success() {
+        return ClipboardFileSelection::Absent;
+    }
+    match read {
+        Ok(LimitedRead::Complete(bytes)) => clipboard_file_selection_from_jxa(&bytes),
+        Ok(LimitedRead::Empty) => ClipboardFileSelection::Rejected,
+        Ok(LimitedRead::Oversized) | Err(_) => unreachable!("handled before waiting"),
+    }
+}
+
+fn clipboard_file_selection_from_jxa(bytes: &[u8]) -> ClipboardFileSelection {
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(serde_json::Value::Null) => ClipboardFileSelection::Absent,
+        Ok(serde_json::Value::String(path))
+            if !path.is_empty() && Path::new(&path).is_absolute() =>
+        {
+            ClipboardFileSelection::One(PathBuf::from(path))
+        }
+        Ok(serde_json::Value::Bool(false)) | Ok(_) | Err(_) => ClipboardFileSelection::Rejected,
+    }
+}
+
 fn unique_timestamp_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -998,6 +1062,26 @@ pub fn process_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_file_selection_maps_jxa_json_states() {
+        assert_eq!(
+            clipboard_file_selection_from_jxa(b"null\n"),
+            ClipboardFileSelection::Absent
+        );
+        assert_eq!(
+            clipboard_file_selection_from_jxa(br#""/Users/me/report 2026.pdf""#),
+            ClipboardFileSelection::One(PathBuf::from("/Users/me/report 2026.pdf"))
+        );
+        assert_eq!(
+            clipboard_file_selection_from_jxa(b"false\n"),
+            ClipboardFileSelection::Rejected
+        );
+        assert_eq!(
+            clipboard_file_selection_from_jxa(b"not-json"),
+            ClipboardFileSelection::Rejected
+        );
+    }
 
     #[test]
     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {

@@ -246,6 +246,203 @@ impl Drop for TempImageFile {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+
+struct TempClipboardFile {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+impl TempClipboardFile {
+    fn new(file_name: &str, bytes: &[u8]) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "herdr-client-file-drop-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join(file_name);
+        std::fs::write(&path, bytes).unwrap();
+        Self { directory, path }
+    }
+}
+
+impl Drop for TempClipboardFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[test]
+fn regular_file_reader_preserves_basename_and_bytes() {
+    let file = TempClipboardFile::new("report final.pdf", b"contents");
+
+    let result = read_clipboard_file(crate::platform::ClipboardFileSelection::One(
+        file.path.clone(),
+    ));
+
+    assert!(matches!(
+        result,
+        FileProbe::Ready(ClipboardFile { file_name, bytes })
+            if file_name == "report final.pdf" && bytes == b"contents"
+    ));
+}
+
+#[test]
+fn regular_file_reader_preserves_selection_state_and_rejects_invalid_files() {
+    assert_eq!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::Absent),
+        FileProbe::Absent
+    );
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::Rejected),
+        FileProbe::Rejected(_)
+    ));
+
+    let empty = TempClipboardFile::new("empty.txt", b"");
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::One(
+            empty.path.clone()
+        )),
+        FileProbe::Rejected(_)
+    ));
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::One(
+            empty.directory.clone()
+        )),
+        FileProbe::Rejected(_)
+    ));
+}
+
+#[test]
+fn regular_file_reader_enforces_sixteen_mibibyte_limit() {
+    let maximum = crate::protocol::endpoint::MAX_CLIPBOARD_FILE_PAYLOAD;
+    let accepted = TempClipboardFile::new("accepted.bin", &vec![7; maximum]);
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::One(
+            accepted.path.clone()
+        )),
+        FileProbe::Ready(_)
+    ));
+
+    let oversized = TempClipboardFile::new("oversized.bin", &vec![7; maximum + 1]);
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::One(
+            oversized.path.clone()
+        )),
+        FileProbe::Rejected(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_file_reader_rejects_a_lossy_name_over_wire_limit() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "herdr-client-lossy-file-name-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join(std::ffi::OsString::from_vec(vec![0xff; 86]));
+    std::fs::write(&path, b"contents").unwrap();
+
+    assert!(matches!(
+        read_clipboard_file(crate::platform::ClipboardFileSelection::One(path)),
+        FileProbe::Rejected(_)
+    ));
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn clipboard_bridge_prefers_one_file_over_image() {
+    let file = ClipboardFile {
+        file_name: "report.pdf".into(),
+        bytes: b"file".to_vec(),
+    };
+    let image_called = std::cell::Cell::new(false);
+
+    let selected = select_clipboard_bridge(FileProbe::Ready(file.clone()), || {
+        image_called.set(true);
+        Some(crate::platform::ClipboardImage {
+            bytes: b"image".to_vec(),
+            extension: "png",
+        })
+    });
+
+    assert_eq!(selected, ClipboardBridge::File(file));
+    assert!(!image_called.get());
+}
+
+#[test]
+fn clipboard_bridge_falls_back_to_image_only_when_file_format_is_absent() {
+    let image = crate::platform::ClipboardImage {
+        bytes: b"image".to_vec(),
+        extension: "png",
+    };
+    assert_eq!(
+        select_clipboard_bridge(FileProbe::<ClipboardFile>::Absent, || Some(image.clone())),
+        ClipboardBridge::Image(image)
+    );
+}
+
+#[test]
+fn rejected_file_selection_does_not_fall_back_to_image_or_consume_input() {
+    let image_called = std::cell::Cell::new(false);
+    let selected = select_clipboard_bridge(
+        FileProbe::<ClipboardFile>::Rejected("multiple files"),
+        || {
+            image_called.set(true);
+            None
+        },
+    );
+
+    assert_eq!(selected, ClipboardBridge::Forward);
+    assert!(!image_called.get());
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_file_drop_accepts_one_extensionless_regular_file() {
+    let file = TempClipboardFile::new("LICENSE", b"license");
+    let input = format!("\x1b[200~{}\x1b[201~", file.path.display());
+
+    assert!(matches!(
+        read_file_from_terminal_drop(input.as_bytes(), true, true),
+        FileProbe::Ready(ClipboardFile { file_name, bytes })
+            if file_name == "LICENSE" && bytes == b"license"
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_file_drop_rejects_invalid_selection_without_splitting_paths() {
+    let file = TempClipboardFile::new("notes.txt", b"notes");
+    let path = file.path.display();
+
+    assert_eq!(
+        read_file_from_terminal_drop(format!("{path}\n{path}").as_bytes(), true, true),
+        FileProbe::Rejected("file drop must contain one path")
+    );
+    assert!(matches!(
+        read_file_from_terminal_drop(b"relative.txt", true, true),
+        FileProbe::Rejected(_)
+    ));
+    assert_eq!(
+        read_file_from_terminal_drop(file.path.to_string_lossy().as_bytes(), true, false),
+        FileProbe::Absent
+    );
+    assert_eq!(
+        read_file_from_terminal_drop(file.path.to_string_lossy().as_bytes(), false, true),
+        FileProbe::Absent
+    );
+}
 #[cfg(unix)]
 #[test]
 fn remote_image_file_drop_bridge_reads_bracketed_absolute_image_path() {

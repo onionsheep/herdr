@@ -2,14 +2,17 @@ use std::{
     collections::{HashSet, VecDeque},
     io::Write,
     os::fd::RawFd,
+    os::unix::ffi::OsStringExt,
     path::PathBuf,
     process::{Command, Stdio},
     sync::OnceLock,
 };
 
+use base64::Engine as _;
+
 use super::{
-    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
-    LimitedRead, Signal,
+    read_limited_reader, ClipboardCommand, ClipboardFileSelection, ClipboardImage, ForegroundJob,
+    ForegroundProcess, LimitedRead, Signal,
 };
 
 pub(crate) use super::unix_common::{
@@ -515,6 +518,230 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     None
 }
 
+pub fn read_clipboard_file() -> ClipboardFileSelection {
+    if running_inside_wsl() {
+        match read_wsl_clipboard_file_with_commands(|program| Command::new(program)) {
+            ClipboardFileSelection::Absent => {}
+            selection => return selection,
+        }
+    }
+
+    for (program, args) in clipboard_file_commands() {
+        match read_clipboard_file_with_command(program, args) {
+            ClipboardFileSelection::Absent => continue,
+            selection => return selection,
+        }
+    }
+    ClipboardFileSelection::Absent
+}
+
+fn clipboard_file_commands() -> Vec<(&'static str, &'static [&'static str])> {
+    let mut commands = Vec::new();
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        commands.push((
+            "wl-paste",
+            &["--type", "x-special/gnome-copied-files"] as &[_],
+        ));
+        commands.push(("wl-paste", &["--type", "text/uri-list"] as &[_]));
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        commands.push((
+            "xclip",
+            &[
+                "-selection",
+                "clipboard",
+                "-t",
+                "x-special/gnome-copied-files",
+                "-o",
+            ] as &[_],
+        ));
+        commands.push((
+            "xclip",
+            &["-selection", "clipboard", "-t", "text/uri-list", "-o"] as &[_],
+        ));
+    }
+    commands
+}
+
+fn read_clipboard_file_with_command(program: &str, args: &[&str]) -> ClipboardFileSelection {
+    let mut command = Command::new(program);
+    command.args(args);
+    match read_bounded_command_output(command, 64 * 1024) {
+        CommandOutput::Absent => ClipboardFileSelection::Absent,
+        CommandOutput::Rejected => ClipboardFileSelection::Rejected,
+        CommandOutput::Bytes(bytes) => parse_clipboard_file_list(&bytes),
+    }
+}
+
+fn parse_clipboard_file_list(bytes: &[u8]) -> ClipboardFileSelection {
+    let mut paths = Vec::new();
+    for (index, raw_line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        if index == 0 && matches!(line, b"copy" | b"cut") {
+            continue;
+        }
+        let Some(path) = local_file_uri_path(line) else {
+            return ClipboardFileSelection::Rejected;
+        };
+        paths.push(path);
+        if paths.len() > 1 {
+            return ClipboardFileSelection::Rejected;
+        }
+    }
+
+    match paths.pop() {
+        Some(path) => ClipboardFileSelection::One(path),
+        None => ClipboardFileSelection::Rejected,
+    }
+}
+
+fn local_file_uri_path(uri: &[u8]) -> Option<PathBuf> {
+    let rest = uri.strip_prefix(b"file://")?;
+    let path = if rest.starts_with(b"/") {
+        rest
+    } else {
+        let slash = rest.iter().position(|byte| *byte == b'/')?;
+        if &rest[..slash] != b"localhost" {
+            return None;
+        }
+        &rest[slash..]
+    };
+    let decoded = percent_decode_path(path)?;
+    if decoded.first() != Some(&b'/') || decoded.contains(&0) {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+}
+
+fn percent_decode_path(value: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] != b'%' {
+            decoded.push(value[index]);
+            index += 1;
+            continue;
+        }
+        let high = hex_value(*value.get(index + 1)?)?;
+        let low = hex_value(*value.get(index + 2)?)?;
+        decoded.push(high << 4 | low);
+        index += 3;
+    }
+    Some(decoded)
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+enum CommandOutput {
+    Absent,
+    Rejected,
+    Bytes(Vec<u8>),
+}
+
+fn read_bounded_command_output(mut command: Command, max_bytes: usize) -> CommandOutput {
+    let mut child = match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return CommandOutput::Absent,
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return CommandOutput::Absent;
+    };
+    let read = read_limited_reader(stdout, max_bytes);
+    if matches!(read, Ok(LimitedRead::Oversized) | Err(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return CommandOutput::Rejected;
+    }
+    let Ok(status) = child.wait() else {
+        return CommandOutput::Absent;
+    };
+    if !status.success() {
+        return CommandOutput::Absent;
+    }
+    match read {
+        Ok(LimitedRead::Complete(bytes)) => CommandOutput::Bytes(bytes),
+        Ok(LimitedRead::Empty) => CommandOutput::Rejected,
+        Ok(LimitedRead::Oversized) | Err(_) => unreachable!("handled before waiting"),
+    }
+}
+
+fn read_wsl_clipboard_file_with_commands(
+    mut command: impl FnMut(&str) -> Command,
+) -> ClipboardFileSelection {
+    let mut powershell = command("powershell.exe");
+    powershell.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-STA",
+        "-Command",
+        "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; $files=[System.Windows.Forms.Clipboard]::GetFileDropList(); if ($null -eq $files -or $files.Count -eq 0) { Write-Output 'absent'; exit 0 }; if ($files.Count -ne 1) { Write-Output 'rejected'; exit 0 }; $bytes=[System.Text.Encoding]::Unicode.GetBytes([string]$files[0]); Write-Output ('one:' + [Convert]::ToBase64String($bytes))",
+    ]);
+    let encoded = match read_bounded_command_output(powershell, 64 * 1024) {
+        CommandOutput::Absent => return ClipboardFileSelection::Absent,
+        CommandOutput::Rejected => return ClipboardFileSelection::Rejected,
+        CommandOutput::Bytes(bytes) => bytes,
+    };
+    let Some(windows_path) = parse_wsl_clipboard_file_output(&encoded) else {
+        return if encoded.starts_with(b"absent") {
+            ClipboardFileSelection::Absent
+        } else {
+            ClipboardFileSelection::Rejected
+        };
+    };
+
+    let mut wslpath = command("wslpath");
+    wslpath.args(["-u", "--", &windows_path]);
+    let path = match read_bounded_command_output(wslpath, 64 * 1024) {
+        CommandOutput::Bytes(bytes) => bytes,
+        CommandOutput::Absent | CommandOutput::Rejected => return ClipboardFileSelection::Rejected,
+    };
+    clipboard_file_selection_from_wslpath_output(&path)
+}
+
+fn clipboard_file_selection_from_wslpath_output(bytes: &[u8]) -> ClipboardFileSelection {
+    let path = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let path = path.strip_suffix(b"\r").unwrap_or(path);
+    if path.is_empty() || path.contains(&b'\n') || path.first() != Some(&b'/') {
+        return ClipboardFileSelection::Rejected;
+    }
+    ClipboardFileSelection::One(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())))
+}
+
+fn parse_wsl_clipboard_file_output(bytes: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(bytes).ok()?.trim();
+    let encoded = value.strip_prefix("one:")?;
+    let utf16_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let chunks = utf16_bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    let utf16 = chunks
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&utf16)
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
 fn read_wsl_clipboard_image_with_command(
     mut command: impl FnMut(&str) -> Command,
 ) -> Option<ClipboardImage> {
@@ -839,6 +1066,88 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn clipboard_file_uri_list_accepts_one_local_percent_encoded_path() {
+        assert_eq!(
+            parse_clipboard_file_list(b"# comment\r\nfile:///tmp/report%202026.pdf\r\n"),
+            ClipboardFileSelection::One(PathBuf::from("/tmp/report 2026.pdf"))
+        );
+        assert_eq!(
+            parse_clipboard_file_list("file:///tmp/报告.pdf\n".as_bytes()),
+            ClipboardFileSelection::One(PathBuf::from("/tmp/报告.pdf"))
+        );
+        assert_eq!(
+            parse_clipboard_file_list(b"file://localhost/tmp/report.pdf\n"),
+            ClipboardFileSelection::One(PathBuf::from("/tmp/report.pdf"))
+        );
+    }
+
+    #[test]
+    fn clipboard_file_uri_list_accepts_gnome_copy_metadata() {
+        assert_eq!(
+            parse_clipboard_file_list(b"copy\nfile:///tmp/report.pdf\n"),
+            ClipboardFileSelection::One(PathBuf::from("/tmp/report.pdf"))
+        );
+        assert_eq!(
+            parse_clipboard_file_list(b"cut\r\nfile:///tmp/report.pdf\r\n"),
+            ClipboardFileSelection::One(PathBuf::from("/tmp/report.pdf"))
+        );
+    }
+
+    #[test]
+    fn clipboard_file_uri_list_rejects_multiple_remote_or_invalid_files() {
+        for bytes in [
+            b"file:///tmp/a\nfile:///tmp/b\n".as_slice(),
+            b"file://remote/tmp/a\n".as_slice(),
+            b"https://example.test/a\n".as_slice(),
+            b"file:///tmp/bad%2Gname\n".as_slice(),
+            b"copy\n".as_slice(),
+        ] {
+            assert_eq!(
+                parse_clipboard_file_list(bytes),
+                ClipboardFileSelection::Rejected
+            );
+        }
+    }
+
+    #[test]
+    fn wsl_clipboard_file_output_decodes_utf16_path() {
+        use base64::Engine as _;
+
+        let utf16 = r#"C:\Users\me\报告 2026.pdf"#
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let output = format!(
+            "one:{}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(utf16)
+        );
+        assert_eq!(
+            parse_wsl_clipboard_file_output(output.as_bytes()).as_deref(),
+            Some(r#"C:\Users\me\报告 2026.pdf"#)
+        );
+        assert_eq!(parse_wsl_clipboard_file_output(b"absent\r\n"), None);
+        assert_eq!(parse_wsl_clipboard_file_output(b"rejected\r\n"), None);
+        assert_eq!(parse_wsl_clipboard_file_output(b"one:not-base64"), None);
+    }
+
+    #[test]
+    fn wslpath_output_accepts_lf_and_crlf_absolute_paths() {
+        for bytes in [
+            b"/mnt/c/Users/me/report.pdf\n".as_slice(),
+            b"/mnt/c/Users/me/report.pdf\r\n".as_slice(),
+        ] {
+            assert_eq!(
+                clipboard_file_selection_from_wslpath_output(bytes),
+                ClipboardFileSelection::One(PathBuf::from("/mnt/c/Users/me/report.pdf"))
+            );
+        }
+        assert_eq!(
+            clipboard_file_selection_from_wslpath_output(b"relative.pdf\n"),
+            ClipboardFileSelection::Rejected
+        );
     }
 
     #[test]

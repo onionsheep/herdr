@@ -2092,7 +2092,7 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
     );
     assert_eq!(server.foreground_client_id, Some(11));
     let pane_id = server.app.session_snapshot().focused_pane_id.unwrap();
-    assert!(server.paste_client_clipboard_image_path(
+    assert!(server.paste_client_clipboard_path(
         11,
         crate::protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
         "/tmp/client-image.png".into(),
@@ -2101,12 +2101,12 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
         input_rx.try_recv().expect("targeted clipboard image path"),
         Bytes::from_static(b"/tmp/client-image.png")
     );
-    assert!(!server.paste_client_clipboard_image_path(
+    assert!(!server.paste_client_clipboard_path(
         11,
         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
         "/tmp/wrong-target.png".into(),
     ));
-    assert!(!server.paste_client_clipboard_image_path(
+    assert!(!server.paste_client_clipboard_path(
         11,
         crate::protocol::ClientClipboardImageTarget::Popup("missing-popup".into()),
         "/tmp/wrong-target.png".into(),
@@ -2129,6 +2129,69 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
     assert_eq!(runtime.current_size(), (24, 79));
     assert!(input_rx.try_recv().is_err(), "legacy release emitted bytes");
     shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn client_clipboard_file_is_staged_routed_and_removed_on_disconnect() {
+    let mut server = test_headless_server();
+    let mut input_rx = install_focused_test_runtime(&mut server, b"");
+    let pane_id = server.app.session_snapshot().focused_pane_id.unwrap();
+    server.clients.insert(
+        41,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+
+    assert!(
+        server.handle_server_event(ServerEvent::ClientClipboardFile {
+            client_id: 41,
+            target: crate::protocol::ClientClipboardImageTarget::Pane(pane_id),
+            file_name: "../../report final.pdf".into(),
+            data: b"contents".to_vec(),
+        })
+    );
+
+    let staged_path = server.clients[&41].staged_clipboard_files[0].clone();
+    assert_eq!(std::fs::read(&staged_path).unwrap(), b"contents");
+    assert!(staged_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with("report_final.pdf"));
+    assert_eq!(
+        input_rx.try_recv().expect("clipboard file path"),
+        Bytes::from(staged_path.to_string_lossy().into_owned())
+    );
+
+    assert!(server.handle_server_event(ServerEvent::ClientDisconnected { client_id: 41 }));
+    assert!(!staged_path.exists());
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn invalid_client_clipboard_file_target_is_not_staged() {
+    let mut server = test_headless_server();
+    let before = crate::server::clipboard_staging::file_staging_paths();
+
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientClipboardFile {
+            client_id: 404,
+            target: crate::protocol::ClientClipboardImageTarget::Pane("missing".into()),
+            file_name: "report.pdf".into(),
+            data: b"contents".to_vec(),
+        })
+    );
+
+    assert_eq!(
+        crate::server::clipboard_staging::file_staging_paths(),
+        before
+    );
 }
 
 #[tokio::test]
@@ -2289,7 +2352,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         popup_input.try_recv().expect("popup input"),
         Bytes::from_static(b"typed")
     );
-    assert!(server.paste_client_clipboard_image_path(
+    assert!(server.paste_client_clipboard_path(
         12,
         crate::protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
         "/tmp/popup-image.png".into(),
@@ -2298,7 +2361,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         popup_input.try_recv().expect("popup clipboard image path"),
         Bytes::from_static(b"/tmp/popup-image.png")
     );
-    assert!(!server.paste_client_clipboard_image_path(
+    assert!(!server.paste_client_clipboard_path(
         12,
         crate::protocol::ClientClipboardImageTarget::Popup("stale-popup".into()),
         "/tmp/wrong-popup.png".into(),

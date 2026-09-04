@@ -353,7 +353,7 @@ impl HeadlessServer {
             .drain()
             .flat_map(|(_, client)| client.staged_clipboard_files)
             .collect::<Vec<_>>();
-        crate::server::clipboard_image::remove_files(staged_files);
+        crate::server::clipboard_staging::remove_files(staged_files);
 
         // Remove socket files.
         self.cleanup_sockets()?;

@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 
 use crate::ipc::LocalStream;
 use crate::protocol::endpoint::{
-    EndpointClientHello, EndpointServerWelcome, ENDPOINT_HELLO_KIND, ENDPOINT_PROTOCOL_GENERATION,
-    ENDPOINT_WELCOME_KIND,
+    decode_clipboard_file, EndpointClientHello, EndpointServerWelcome, CLIPBOARD_FILE_CONTROL_KIND,
+    ENDPOINT_HELLO_KIND, ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND,
 };
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientMessage, ClientPaneInputEvent,
@@ -422,6 +422,13 @@ pub(crate) enum ServerEvent {
         client_id: u64,
         target: crate::protocol::ClientClipboardImageTarget,
         extension: String,
+        data: Vec<u8>,
+    },
+    /// A client sent one local clipboard file to paste into a remote terminal.
+    ClientClipboardFile {
+        client_id: u64,
+        target: crate::protocol::ClientClipboardImageTarget,
+        file_name: String,
         data: Vec<u8>,
     },
     /// A client requested direct attach to one terminal.
@@ -1289,6 +1296,25 @@ fn client_read_loop_with_endpoint_controls(
                     token: data,
                 }
             }
+            ClientMessage::EndpointControl { kind, data }
+                if kind == CLIPBOARD_FILE_CONTROL_KIND =>
+            {
+                let decoded = match decode_clipboard_file(&data) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        warn!(client_id, %error, "invalid clipboard file control, closing");
+                        let _ = server_event_tx
+                            .blocking_send(ServerEvent::ClientDisconnected { client_id });
+                        break;
+                    }
+                };
+                ServerEvent::ClientClipboardFile {
+                    client_id,
+                    target: decoded.target,
+                    file_name: decoded.file_name,
+                    data: decoded.data,
+                }
+            }
             ClientMessage::EndpointControl { kind, data } => {
                 let Some(response) = crate::server::client_endpoint_control::response(&kind, data)
                 else {
@@ -1944,6 +1970,69 @@ mod tests {
             .join()
             .expect("read thread join")
             .expect("read thread result");
+    }
+
+    #[test]
+    fn client_read_loop_decodes_clipboard_file_control() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-clipboard-file");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        let message = crate::protocol::endpoint::clipboard_file_message(
+            crate::protocol::ClientClipboardImageTarget::Pane("w1:p1".into()),
+            "report.pdf".into(),
+            b"contents",
+        )
+        .unwrap();
+        protocol::write_message(&mut client_stream, &message).unwrap();
+        protocol::write_message(&mut client_stream, &ClientMessage::Detach).unwrap();
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "clipboard file event"),
+            ServerEvent::ClientClipboardFile {
+                client_id: 7,
+                target: crate::protocol::ClientClipboardImageTarget::Pane(pane_id),
+                file_name,
+                data,
+            } if pane_id == "w1:p1" && file_name == "report.pdf" && data == b"contents"
+        ));
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "detach event"),
+            ServerEvent::ClientDetach { client_id: 7 }
+        ));
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_read_loop_disconnects_on_invalid_clipboard_file_control() {
+        let (mut client_stream, server_stream, _path) =
+            local_stream_pair("client-read-invalid-clipboard-file");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let read_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            client_read_loop(server_stream, 7, &server_event_tx, &read_quit)
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind: crate::protocol::endpoint::CLIPBOARD_FILE_CONTROL_KIND.into(),
+                data: r#"{"target":"DirectTerminal","file_name":"report.pdf","data_base64":"not base64!"}"#.into(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            recv_server_event(&mut server_event_rx, "invalid clipboard file disconnect"),
+            ServerEvent::ClientDisconnected { client_id: 7 }
+        ));
+        handle.join().unwrap().unwrap();
     }
 
     #[test]

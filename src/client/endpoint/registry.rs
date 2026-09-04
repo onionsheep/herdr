@@ -127,6 +127,12 @@ impl EndpointRegistry {
                 .is_some_and(|connection| connection.surface_active)
     }
 
+    pub(crate) fn active_supports_capability(&self, capability: &str) -> bool {
+        self.connections
+            .get(&self.active)
+            .is_some_and(|connection| connection.negotiation.supports_capability(capability))
+    }
+
     pub(crate) fn select_unavailable_local(&mut self) {
         self.active = ClientEndpointId::Local;
         self.freeze_input();
@@ -470,6 +476,38 @@ mod tests {
             false,
         );
         assert!(!registry.active_surface_available());
+    }
+
+    #[test]
+    fn active_capability_follows_the_selected_endpoint() {
+        let mut registry = EndpointRegistry::new(
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            1,
+            EndpointNegotiation::default(),
+        );
+        let ssh_id = ClientEndpointId::Ssh(profile());
+        registry.insert(
+            ssh_id.clone(),
+            FakeTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                error: None,
+            },
+            2,
+            EndpointNegotiation::new(
+                Vec::new(),
+                vec![crate::protocol::endpoint::CLIPBOARD_FILE_CAPABILITY.into()],
+            ),
+            true,
+        );
+
+        assert!(!registry
+            .active_supports_capability(crate::protocol::endpoint::CLIPBOARD_FILE_CAPABILITY));
+        assert!(registry.set_active(&ssh_id));
+        assert!(registry
+            .active_supports_capability(crate::protocol::endpoint::CLIPBOARD_FILE_CAPABILITY));
     }
 
     #[test]

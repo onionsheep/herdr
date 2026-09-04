@@ -171,7 +171,7 @@ pub(crate) struct ClientConnection {
     pub(crate) host_keyboard_protocol_active: Option<(u16, u8)>,
     /// Presses forwarded by this shell that need release on abrupt teardown.
     shell_held_inputs: HashMap<ClientShellPressId, ClientShellHeldInput>,
-    /// Temporary files staged from this client's local clipboard image pastes.
+    /// Temporary files staged from this client's local clipboard file or image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Connection-local workspace and tab projection for a client-owned shell.
     pub(crate) shell_location: Option<ClientShellLocation>,

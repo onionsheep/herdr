@@ -1,9 +1,12 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
-    ffi::{c_void, OsStr},
+    ffi::{c_void, OsStr, OsString},
     mem::{size_of, MaybeUninit},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::{
+        ffi::OsStringExt,
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    },
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
@@ -177,7 +180,7 @@ use windows_sys::{
                 GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
                 MEMORY_BASIC_INFORMATION,
             },
-            Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT},
+            Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT},
             Threading::{
                 GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenThread,
                 QueryFullProcessImageNameW, ResumeThread, TerminateProcess, CREATE_NO_WINDOW,
@@ -195,8 +198,9 @@ use windows_sys::{
                 },
             },
             Shell::{
-                CommandLineToArgvW, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP,
-                NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+                CommandLineToArgvW, DragQueryFileW, ShellExecuteW, Shell_NotifyIconW, NIF_ICON,
+                NIF_INFO, NIF_TIP, NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+                NOTIFYICONDATAW,
             },
             WindowsAndMessaging::{
                 CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
@@ -206,7 +210,7 @@ use windows_sys::{
     },
 };
 
-use super::{ClipboardImage, ForegroundJob, Signal};
+use super::{ClipboardFileSelection, ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
@@ -2118,6 +2122,50 @@ pub fn read_clipboard_image() -> Option<ClipboardImage> {
     None
 }
 
+pub fn read_clipboard_file() -> ClipboardFileSelection {
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let handle = unsafe { GetClipboardData(CF_HDROP as u32) };
+            if handle.is_null() {
+                return ClipboardFileSelection::Absent;
+            }
+            let count = unsafe { DragQueryFileW(handle, u32::MAX, null_mut(), 0) };
+            if count == 0 {
+                return ClipboardFileSelection::Absent;
+            }
+            if count != 1 {
+                return ClipboardFileSelection::Rejected;
+            }
+            let length = unsafe { DragQueryFileW(handle, 0, null_mut(), 0) };
+            if length == 0 {
+                return ClipboardFileSelection::Rejected;
+            }
+            let mut buffer = vec![0_u16; length as usize + 1];
+            let copied =
+                unsafe { DragQueryFileW(handle, 0, buffer.as_mut_ptr(), buffer.len() as u32) };
+            if copied == 0 || copied > length {
+                return ClipboardFileSelection::Rejected;
+            }
+            return clipboard_file_selection_from_paths(vec![PathBuf::from(OsString::from_wide(
+                &buffer[..copied as usize],
+            ))]);
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    ClipboardFileSelection::Absent
+}
+
+fn clipboard_file_selection_from_paths(mut paths: Vec<PathBuf>) -> ClipboardFileSelection {
+    match paths.len() {
+        0 => ClipboardFileSelection::Absent,
+        1 => ClipboardFileSelection::One(paths.pop().expect("one path")),
+        _ => ClipboardFileSelection::Rejected,
+    }
+}
+
 fn read_registered_png_clipboard() -> Option<Vec<u8>> {
     static PNG_FORMAT: LazyLock<u32> = LazyLock::new(|| {
         let name = wide_null("PNG");
@@ -2695,6 +2743,27 @@ mod tests {
     use windows_sys::Win32::System::Console::{
         AllocConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     };
+
+    #[test]
+    fn clipboard_file_selection_maps_zero_one_or_many_paths() {
+        assert_eq!(
+            super::clipboard_file_selection_from_paths(Vec::new()),
+            super::ClipboardFileSelection::Absent
+        );
+        assert_eq!(
+            super::clipboard_file_selection_from_paths(vec![std::path::PathBuf::from(
+                r#"C:\report.pdf"#
+            )]),
+            super::ClipboardFileSelection::One(std::path::PathBuf::from(r#"C:\report.pdf"#))
+        );
+        assert_eq!(
+            super::clipboard_file_selection_from_paths(vec![
+                std::path::PathBuf::from("a"),
+                std::path::PathBuf::from("b"),
+            ]),
+            super::ClipboardFileSelection::Rejected
+        );
+    }
 
     #[test]
     fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {

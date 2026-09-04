@@ -210,6 +210,13 @@ pub struct ClipboardImage {
     pub extension: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardFileSelection {
+    Absent,
+    One(std::path::PathBuf),
+    Rejected,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LimitedRead {
     Empty,

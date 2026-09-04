@@ -14,6 +14,7 @@
 
 mod attach;
 mod catalog_reload;
+mod clipboard_files;
 mod clipboard_forwarding;
 mod clipboard_images;
 mod config_reload;
@@ -88,6 +89,16 @@ use attach::direct_attach_pixel_mouse;
 use attach::AttachEscapeState;
 #[cfg(unix)]
 use attach::{write_attach_semantic_action, AttachInputAction};
+#[cfg(windows)]
+use clipboard_files::read_file_from_client_events;
+#[cfg(unix)]
+use clipboard_files::read_file_from_terminal_drop;
+#[cfg(test)]
+use clipboard_files::ClipboardFile;
+use clipboard_files::{
+    read_clipboard_file, select_clipboard_bridge, write_remote_file_to_server, ClipboardBridge,
+    FileProbe,
+};
 use clipboard_images::{
     client_remote_image_paste_key, endpoint_accepts_local_images, write_remote_image_to_server,
 };
@@ -725,6 +736,11 @@ async fn run_client_loop(
                     write_stream.active_id(),
                     write_stream.active_surface_available(),
                 );
+                let file_bridge_active = image_bridge_active
+                    && (state.shell.is_none()
+                        || write_stream.active_supports_capability(
+                            crate::protocol::endpoint::CLIPBOARD_FILE_CAPABILITY,
+                        ));
                 if state.shell.is_some() {
                     if will_query_host_cell_size {
                         let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
@@ -743,29 +759,66 @@ async fn run_client_loop(
                             image_bridge_active,
                             state.remote_image_paste_key,
                         ) {
-                            if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
+                            let file = if file_bridge_active {
+                                read_clipboard_file(crate::platform::read_clipboard_file())
+                            } else {
+                                FileProbe::Absent
+                            };
+                            match select_clipboard_bridge(
+                                file,
+                                crate::platform::read_clipboard_image,
+                            ) {
+                                ClipboardBridge::File(file) => {
+                                    write_remote_file_to_server(
+                                        &mut write_stream,
+                                        target.clone(),
+                                        file,
+                                        "clipboard paste",
+                                    )?;
+                                    continue;
+                                }
+                                ClipboardBridge::Image(image) => {
+                                    write_remote_image_to_server(
+                                        &mut write_stream,
+                                        target.clone(),
+                                        image,
+                                        "clipboard paste",
+                                    )?;
+                                    continue;
+                                }
+                                ClipboardBridge::Forward => {}
+                            }
+                        }
+                        match read_file_from_terminal_drop(
+                            &data,
+                            image_bridge_active,
+                            file_bridge_active,
+                        ) {
+                            FileProbe::Ready(file) => {
+                                write_remote_file_to_server(
                                     &mut write_stream,
-                                    target,
-                                    image,
-                                    "clipboard paste",
+                                    target.clone(),
+                                    file,
+                                    "file drop",
                                 )?;
                                 continue;
                             }
-                            info!(
-                                "clipboard image paste trigger received, but local clipboard has no image"
-                            );
-                        }
-                        if let Some(image) =
-                            read_image_file_from_terminal_drop(&data, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
-                            continue;
+                            FileProbe::Rejected(reason) => {
+                                debug!(reason, "local file drop cannot be bridged");
+                            }
+                            FileProbe::Absent => {
+                                if let Some(image) =
+                                    read_image_file_from_terminal_drop(&data, image_bridge_active)
+                                {
+                                    write_remote_image_to_server(
+                                        &mut write_stream,
+                                        target,
+                                        image,
+                                        "file drop",
+                                    )?;
+                                    continue;
+                                }
+                            }
                         }
                     }
                     let (outcome, frame) = {
@@ -859,28 +912,59 @@ async fn run_client_loop(
                     image_bridge_active,
                     state.remote_image_paste_key,
                 ) {
-                    if let Some(image) = crate::platform::read_clipboard_image() {
-                        write_remote_image_to_server(
+                    let file = if file_bridge_active {
+                        read_clipboard_file(crate::platform::read_clipboard_file())
+                    } else {
+                        FileProbe::Absent
+                    };
+                    match select_clipboard_bridge(file, crate::platform::read_clipboard_image) {
+                        ClipboardBridge::File(file) => {
+                            write_remote_file_to_server(
+                                &mut write_stream,
+                                crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                                file,
+                                "clipboard paste",
+                            )?;
+                            continue;
+                        }
+                        ClipboardBridge::Image(image) => {
+                            write_remote_image_to_server(
+                                &mut write_stream,
+                                crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                                image,
+                                "clipboard paste",
+                            )?;
+                            continue;
+                        }
+                        ClipboardBridge::Forward => {}
+                    }
+                }
+                match read_file_from_terminal_drop(&data, image_bridge_active, file_bridge_active) {
+                    FileProbe::Ready(file) => {
+                        write_remote_file_to_server(
                             &mut write_stream,
                             crate::protocol::ClientClipboardImageTarget::DirectTerminal,
-                            image,
-                            "clipboard paste",
+                            file,
+                            "file drop",
                         )?;
                         continue;
                     }
-                    info!(
-                        "clipboard image paste trigger received, but local clipboard has no image"
-                    );
-                }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, image_bridge_active)
-                {
-                    write_remote_image_to_server(
-                        &mut write_stream,
-                        crate::protocol::ClientClipboardImageTarget::DirectTerminal,
-                        image,
-                        "file drop",
-                    )?;
-                    continue;
+                    FileProbe::Rejected(reason) => {
+                        debug!(reason, "local file drop cannot be bridged");
+                    }
+                    FileProbe::Absent => {
+                        if let Some(image) =
+                            read_image_file_from_terminal_drop(&data, image_bridge_active)
+                        {
+                            write_remote_image_to_server(
+                                &mut write_stream,
+                                crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                                image,
+                                "file drop",
+                            )?;
+                            continue;
+                        }
+                    }
                 }
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
@@ -992,6 +1076,10 @@ async fn run_client_loop(
                     write_stream.active_id(),
                     write_stream.active_surface_available(),
                 );
+                let file_bridge_active = image_bridge_active
+                    && write_stream.active_supports_capability(
+                        crate::protocol::endpoint::CLIPBOARD_FILE_CAPABILITY,
+                    );
                 if state.shell.is_some() {
                     let image_target = state
                         .shell
@@ -1003,29 +1091,66 @@ async fn run_client_loop(
                             image_bridge_active,
                             state.remote_image_paste_key,
                         ) {
-                            if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
+                            let file = if file_bridge_active {
+                                read_clipboard_file(crate::platform::read_clipboard_file())
+                            } else {
+                                FileProbe::Absent
+                            };
+                            match select_clipboard_bridge(
+                                file,
+                                crate::platform::read_clipboard_image,
+                            ) {
+                                ClipboardBridge::File(file) => {
+                                    write_remote_file_to_server(
+                                        &mut write_stream,
+                                        target.clone(),
+                                        file,
+                                        "clipboard paste",
+                                    )?;
+                                    continue;
+                                }
+                                ClipboardBridge::Image(image) => {
+                                    write_remote_image_to_server(
+                                        &mut write_stream,
+                                        target.clone(),
+                                        image,
+                                        "clipboard paste",
+                                    )?;
+                                    continue;
+                                }
+                                ClipboardBridge::Forward => {}
+                            }
+                        }
+                        match read_file_from_client_events(
+                            &events,
+                            image_bridge_active,
+                            file_bridge_active,
+                        ) {
+                            FileProbe::Ready(file) => {
+                                write_remote_file_to_server(
                                     &mut write_stream,
-                                    target,
-                                    image,
-                                    "clipboard paste",
+                                    target.clone(),
+                                    file,
+                                    "file drop",
                                 )?;
                                 continue;
                             }
-                            info!(
-                                "clipboard image paste trigger received, but local clipboard has no image"
-                            );
-                        }
-                        if let Some(image) =
-                            read_image_file_from_client_events(&events, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
-                            continue;
+                            FileProbe::Rejected(reason) => {
+                                debug!(reason, "local file drop cannot be bridged");
+                            }
+                            FileProbe::Absent => {
+                                if let Some(image) =
+                                    read_image_file_from_client_events(&events, image_bridge_active)
+                                {
+                                    write_remote_image_to_server(
+                                        &mut write_stream,
+                                        target,
+                                        image,
+                                        "file drop",
+                                    )?;
+                                    continue;
+                                }
+                            }
                         }
                     }
                     let (outcome, frame) = {
